@@ -10,19 +10,14 @@ import {
 } from '../../domain/models.js';
 import { Database } from '../database.js';
 import { logger } from '../logger.js';
+import { DropoutQueries } from '../database/queries/DropoutQueries.js';
 
 export class CustomerRepository implements ICustomerRepository {
 
   async checkBranchEODStatus(brCode: string): Promise<{ isClosed: boolean, operationDate: Date | null }> {
     try {
       const pool = await Database.getConnection();
-      const query = `SELECT TOP 1 
-                      LBrCode, 
-                      DyfDate AS OperationDate, 
-                      DayEndFlag
-                      FROM D010007 
-                      WHERE LBrCode = @brCode 
-                      ORDER BY DyfDate DESC;`;
+      const query = DropoutQueries.CHECK_EOD_STATUS;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .query(query);
@@ -49,14 +44,7 @@ export class CustomerRepository implements ICustomerRepository {
       // Pad to 8 digits in Node.js to reduce SQL overhead
       const paddedCustNo = String(custNo).padStart(8, '0');
       
-      const query = `
-                    SELECT TOP 1 1
-                    FROM D009040 a
-                    WHERE a.LBrCode = @brCode
-                    AND a.EntryDate = @opDate 
-                    AND a.MainAcctId LIKE '________' + @paddedCustNo + '%'
-                    AND a.CanceledFlag <> 'C';
-      `;
+      const query = DropoutQueries.HAS_TRANSACTION_TODAY;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('opDate', sql.DateTime, operationDate)
@@ -74,19 +62,7 @@ export class CustomerRepository implements ICustomerRepository {
     try {
       const pool = await Database.getConnection();
       
-      const query = `
-                    SELECT 
-                        a.CustNo
-                    FROM D009015 a
-                    INNER JOIN D009011 b ON a.CustNo = b.CustNo
-                    INNER JOIN D010014 c ON b.LBrCode = c.LBrCode 
-                        AND SUBSTRING(c.PrdAcctId, 9, 8) = a.CustNo
-                        AND c.CblDate = (SELECT MAX(CblDate) FROM D010014 WHERE LBrCode = c.LBrCode AND PrdAcctId = c.PrdAcctId)
-                    WHERE a.CustStatus = 1 
-                        AND b.LBrCode = @brCode
-                        GROUP BY a.CustNo
-                        HAVING SUM(ABS(c.Balance1)) + SUM(ABS(c.Balance4)) + SUM(ABS(c.Balance13)) = 0;
-      `;
+      const query = DropoutQueries.GET_ELIGIBLE_CUSTOMERS;
 
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
@@ -107,28 +83,7 @@ export class CustomerRepository implements ICustomerRepository {
     try {
       const pool = await Database.getConnection();
       
-      const query = `
-        -- Fetch Savings
-        SELECT 'SAVINGS' as type, a.PrdAcctId as accountNo, a.AcctStat as status, a.ShdClrBalFcy as balance, 0 as penalPaidFcy, 0 as penalPrvdFcy, 0 as totalCredit 
-        FROM D009022 a 
-        INNER JOIN D009021 b ON a.LBrCode = b.LBrCode AND a.PrdAcctId LIKE b.PrdCd + '%'
-        WHERE a.CustNo = @custNo AND a.AcctStat IN (1,2) AND b.ModuleType = 11
-        
-        UNION ALL
-        
-        -- Fetch Loan
-        SELECT 'LOAN' as type, a.PrdAcctId as accountNo, a.AcctStat as status, b.MainBalFcy as balance, b.PenalPaidFcy as penalPaidFcy, b.PenalPrvdFcy as penalPrvdFcy, b.TotalCredit as totalCredit
-        FROM D009022 a 
-        INNER JOIN D030003 b ON a.LBrCode = b.LBrCode AND a.PrdAcctId = b.PrdAcctId 
-        WHERE a.CustNo = @custNo AND a.AcctStat IN (1,2)
-        
-        UNION ALL
-        
-        -- Fetch Term Deposit
-        SELECT 'TERM_DEPOSIT' as type, PrdAcctId as accountNo, ReceiptStatus as status, MainBalFcy as balance, 0 as penalPaidFcy, 0 as penalPrvdFcy, 0 as totalCredit 
-        FROM D020004 
-        WHERE LBrCode = @brCode AND PrdAcctId LIKE '________' + RIGHT('00000000' + CAST(@custNo AS VARCHAR), 8) + '%' AND ReceiptStatus != 99;
-      `;
+      const query = DropoutQueries.GET_ACCOUNT_STATE;
 
       const result = await pool.request()
         .input('custNo', sql.VarChar, String(custNo))
@@ -163,11 +118,7 @@ export class CustomerRepository implements ICustomerRepository {
   async recalculateLoanBalance(brCode: string, prdAcctId: string): Promise<number> {
     try {
       const pool = await Database.getHistoryConnection();
-      const query = `
-        SELECT SUM(CASE WHEN DrCr = 'D' THEN FcyTrnAmt ELSE -FcyTrnAmt END) AS CalculatedBalance
-        FROM MFPRPLDB.dbo.VD009040
-        WHERE LBrCode = @brCode AND VcrAcctId = @prdAcctId AND CanceledFlag <> 'C'
-      `;
+      const query = DropoutQueries.RECALCULATE_LOAN_BALANCE;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('prdAcctId', sql.VarChar, String(prdAcctId))
@@ -182,11 +133,7 @@ export class CustomerRepository implements ICustomerRepository {
   async recalculateLoanCredit(brCode: string, prdAcctId: string): Promise<number> {
     try {
       const pool = await Database.getHistoryConnection();
-      const query = `
-        SELECT SUM(CASE WHEN DrCr = 'D' THEN FcyTrnAmt ELSE -FcyTrnAmt END) AS CalculatedBalance
-        FROM MFPRPLDB.dbo.VD009040
-        WHERE LBrCode = @brCode AND MainAcctId = @prdAcctId AND VcrAcctId LIKE '94%' AND CanceledFlag <> 'C'
-      `;
+      const query = DropoutQueries.RECALCULATE_LOAN_CREDIT;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('prdAcctId', sql.VarChar, String(prdAcctId))
@@ -201,11 +148,7 @@ export class CustomerRepository implements ICustomerRepository {
   async recalculateSavingsBalance(brCode: string, prdAcctId: string): Promise<number> {
     try {
       const pool = await Database.getHistoryConnection();
-      const query = `
-        SELECT SUM(CASE WHEN DrCr = 'D' THEN FcyTrnAmt ELSE -FcyTrnAmt END) AS CalculatedBalance
-        FROM MFPRPLDB.dbo.VD009040
-        WHERE LBrCode = @brCode AND VcrAcctId = @prdAcctId AND CanceledFlag <> 'C'
-      `;
+      const query = DropoutQueries.RECALCULATE_SAVINGS_BALANCE;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('prdAcctId', sql.VarChar, String(prdAcctId))
@@ -220,11 +163,7 @@ export class CustomerRepository implements ICustomerRepository {
   async recalculateTermDepositBalance(brCode: string, prdAcctId: string): Promise<number> {
     try {
       const pool = await Database.getHistoryConnection();
-      const query = `
-        SELECT SUM(CASE WHEN DrCr = 'D' THEN FcyTrnAmt ELSE -FcyTrnAmt END) AS CalculatedBalance
-        FROM MFPRPLDB.dbo.VD009040
-        WHERE LBrCode = @brCode AND VcrAcctId = @prdAcctId AND CanceledFlag <> 'C'
-      `;
+      const query = DropoutQueries.RECALCULATE_TERM_DEPOSIT_BALANCE;
       const result = await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('prdAcctId', sql.VarChar, String(prdAcctId))
@@ -261,17 +200,17 @@ export class CustomerRepository implements ICustomerRepository {
           if (acc.zeroOutBalance) {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
-              .query(`UPDATE dbo.D030003 SET MainBalFcy = 0, MainBalLcy = 0, TotalCredit = 0, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_LOAN_D030003);
             
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D009022 SET ShdClrBalFcy = 0, ShdTotBalFcy = 0, ActClrBalFcy = 0, ActTotBalFcy = 0, ActTotBalLcy = 0, AcctStat = 3, DateClosed = @operationDate, ClosedUser = '11', SplInstr2 = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D009022_ZERO_OUT);
           } else {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D009022 SET AcctStat = 3, DateClosed = @operationDate, ClosedUser = '11', SplInstr2 = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D009022_STATUS_ONLY);
           }
         } 
         else if (acc.type === 'SAVINGS') {
@@ -279,12 +218,12 @@ export class CustomerRepository implements ICustomerRepository {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D009022 SET ShdClrBalFcy = 0, ShdTotBalFcy = 0, ActClrBalFcy = 0, ActTotBalFcy = 0, ActTotBalLcy = 0, AcctStat = 3, DateClosed = @operationDate, ClosedUser = '11', SplInstr2 = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D009022_ZERO_OUT);
           } else {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D009022 SET AcctStat = 3, DateClosed = @operationDate, ClosedUser = '11', SplInstr2 = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D009022_STATUS_ONLY);
           }
         } 
         else if (acc.type === 'TERM_DEPOSIT') {
@@ -292,12 +231,12 @@ export class CustomerRepository implements ICustomerRepository {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D020004 SET MainBalFcy = 0, MainBalLcy = 0, ReceiptStatus = 99, ClosedDate = @operationDate, Remarks = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D020004_ZERO_OUT);
           } else {
             await transaction.request()
               .input('brCode', sql.VarChar, brCode).input('prdAcctId', sql.VarChar, prdAcctId)
               .input('operationDate', sql.DateTime, command.operationDate).input('msg', sql.VarChar, closeMessage)
-              .query(`UPDATE dbo.D020004 SET ReceiptStatus = 99, ClosedDate = @operationDate, Remarks = @msg, DbtrUpdtChkId = DbtrUpdtChkId + 1 WHERE LBrCode = @brCode AND PrdAcctId = @prdAcctId;`);
+              .query(DropoutQueries.BATCH_UPDATE_D020004_STATUS_ONLY);
           }
         }
 
@@ -305,21 +244,21 @@ export class CustomerRepository implements ICustomerRepository {
       }
 
       for (const anomaly of command.anomaliesToLog) {
-        // TODO: Implementation of anomaly logging into Anomaly_Logs
-        logger.warn(`Anomaly detected: ${anomaly.accountNo}`, { context: 'CustomerRepository', anomaly });
+        await transaction.request()
+          .input('custNo', sql.VarChar, String(anomaly.custNo))
+          .input('accType', sql.VarChar, anomaly.accountType)
+          .input('accNo', sql.VarChar, String(anomaly.accountNo))
+          .input('balance', sql.Decimal(18, 2), anomaly.lingeringBalance)
+          .input('timestamp', sql.DateTime, anomaly.timestamp)
+          .query(DropoutQueries.LOG_ANOMALY);
+
+        logger.warn(`Anomaly saved to DB: ${anomaly.accountNo}`, { context: 'CustomerRepository', anomaly });
       }
 
       await transaction.request()
         .input('custNo', sql.VarChar, String(command.custNo))
         .input('operationDate', sql.DateTime, command.operationDate)
-        .query(`
-          UPDATE dbo.D009015
-          SET CustStatus = 2,
-              DropOutDate = @operationDate,
-              DropOutDoneBy = 11,
-              DbtrUpdtChkId = DbtrUpdtChkId + 1
-          WHERE CustNo = @custNo;
-        `);
+        .query(DropoutQueries.UPDATE_CUSTOMER_DROPOUT);
 
       await transaction.commit();
     } catch (error) {
@@ -332,21 +271,7 @@ export class CustomerRepository implements ICustomerRepository {
   async syncBranchTracker(): Promise<void> {
     try {
       const pool = await Database.getConnection();
-      const query = `
-        WITH ActiveBranches AS (
-            SELECT BrCode FROM BranchList WHERE BrCode >= 111001 AND PCode IN (2,3) AND BranchStatus = 1
-        )
-        MERGE dbo.BranchDropoutTracker AS Target
-        USING ActiveBranches AS Source
-        ON (Target.BrCode = Source.BrCode)
-        WHEN MATCHED THEN 
-            UPDATE SET IsActive = 1
-        WHEN NOT MATCHED BY TARGET THEN
-            INSERT (BrCode, IsActive, LastExecutionTime, NoOfExecution, NoOfDropout)
-            VALUES (Source.BrCode, 1, NULL, 0, 0)
-        WHEN NOT MATCHED BY SOURCE THEN
-            UPDATE SET IsActive = 0;
-      `;
+      const query = DropoutQueries.SYNC_BRANCH_TRACKER;
       await pool.request().query(query);
       logger.info('Branch tracker synchronized successfully.', { context: 'CustomerRepository' });
     } catch (error) {
@@ -358,7 +283,7 @@ export class CustomerRepository implements ICustomerRepository {
   async getActiveBranchesFromTracker(): Promise<number[]> {
     try {
       const pool = await Database.getConnection();
-      const query = `SELECT BrCode FROM dbo.BranchDropoutTracker WHERE IsActive = 1`;
+      const query = DropoutQueries.GET_ACTIVE_BRANCHES;
       const result = await pool.request().query(query);
       return result.recordset.map(row => row.BrCode);
     } catch (error) {
@@ -370,13 +295,7 @@ export class CustomerRepository implements ICustomerRepository {
   async updateBranchTrackerStats(brCode: string, dropoutCount: number): Promise<void> {
     try {
       const pool = await Database.getConnection();
-      const query = `
-        UPDATE dbo.BranchDropoutTracker 
-        SET LastExecutionTime = GETDATE(),
-            NoOfExecution = NoOfExecution + 1,
-            NoOfDropout = NoOfDropout + @dropoutCount
-        WHERE BrCode = @brCode;
-      `;
+      const query = DropoutQueries.UPDATE_BRANCH_STATS;
       await pool.request()
         .input('brCode', sql.VarChar, String(brCode))
         .input('dropoutCount', sql.Int, dropoutCount)
@@ -389,10 +308,7 @@ export class CustomerRepository implements ICustomerRepository {
   async logSuccess(log: ProcessLogSuccess): Promise<void> {
     try {
       const pool = await Database.getConnection();
-      const query = `
-        INSERT INTO Process_Log_Success (brCode, custNo, closedAccountsInfo, timestamp)
-        VALUES (@brCode, @custNo, @info, @timestamp)
-      `;
+      const query = DropoutQueries.LOG_SUCCESS;
       await pool.request()
         .input('brCode', sql.VarChar, String(log.brCode))
         .input('custNo', sql.VarChar, String(log.custNo))
@@ -407,10 +323,7 @@ export class CustomerRepository implements ICustomerRepository {
   async logError(log: ProcessLogError): Promise<void> {
     try {
       const pool = await Database.getConnection();
-      const query = `
-        INSERT INTO Process_Log_Error (brCode, custNo, failedStep, errorReason, timestamp)
-        VALUES (@brCode, @custNo, @step, @reason, @timestamp)
-      `;
+      const query = DropoutQueries.LOG_ERROR;
       await pool.request()
         .input('brCode', sql.VarChar, String(log.brCode))
         .input('custNo', sql.VarChar, String(log.custNo))

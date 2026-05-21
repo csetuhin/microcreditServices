@@ -1,5 +1,5 @@
 import { ICustomerRepository } from '../../application/ports/ICustomerRepository.js';
-import { BatchDropoutCommand } from '../../domain/models.js';
+import { AccountState, BatchDropoutCommand } from '../../domain/models.js';
 import { logger } from '../../infrastructure/logger.js';
 
 export class DropoutProcessService {
@@ -50,7 +50,6 @@ export class DropoutProcessService {
           // Step 4: Fetch detailed account state
           const accountState = await this.customerRepo.getCustomerAccountsState(customer.custNo, brCode);
           
-          let isValidForDropout = true;
           const command: BatchDropoutCommand = {
             custNo: customer.custNo,
             brCode: brCode,
@@ -59,179 +58,17 @@ export class DropoutProcessService {
             anomaliesToLog: []
           };
 
-          // Step 5: Loan Validation (Fail-fast)
-          for (const loan of accountState.loans) {
-            logger.debug(`Validating Loan Account: ${loan.accountNo}`, { context: 'DropoutProcessService' });
+          // Step 5: Loan Validation
+          const isLoansValid = await this.validateLoans(accountState.loans, brCode, customer.custNo, command);
+          if (!isLoansValid) continue;
 
-            // Rule 5.1: Penal Paid must match Penal Provided
-            if (loan.penalPaidFcy !== loan.penalPrvdFcy) {
-              const reason = `Penal mismatch on Loan ${loan.accountNo} (Paid: ${loan.penalPaidFcy}, Prvd: ${loan.penalPrvdFcy})`;
-              logger.warn(`Skipping Customer ${customer.custNo}: ${reason}`, { context: 'DropoutProcessService' });
-              
-              await this.customerRepo.logError({
-                brCode,
-                custNo: customer.custNo,
-                failedStep: 'LOAN_VALIDATION',
-                errorReason: reason,
-                timestamp: new Date()
-              });
+          // Step 6: Term Deposit Validation
+          const isTDsValid = await this.validateTermDeposits(accountState.termDeposits, brCode, customer.custNo, command);
+          if (!isTDsValid) continue;
 
-              isValidForDropout = false;
-              break;
-            }
-
-            let zeroOutBalance = false;
-
-            // Rule 5.2: Balance Check & Recalculation
-            if (loan.balance !== 0) {
-              const calculatedBalance = await this.customerRepo.recalculateLoanBalance(brCode, loan.accountNo);
-              if (calculatedBalance !== 0) {
-                const reason = `Non-zero calculated balance on Loan ${loan.accountNo} (${calculatedBalance})`;
-                logger.warn(`Skipping Customer ${customer.custNo}: ${reason}`, { context: 'DropoutProcessService' });
-                
-                await this.customerRepo.logError({
-                  brCode,
-                  custNo: customer.custNo,
-                  failedStep: 'LOAN_VALIDATION',
-                  errorReason: reason,
-                  timestamp: new Date()
-                });
-
-                isValidForDropout = false;
-                break;
-              }
-              zeroOutBalance = true;
-            }
-
-            // Rule 5.3: Total Credit Check & Recalculation
-            if (loan.totalCredit !== 0) {
-              const calculatedCredit = await this.customerRepo.recalculateLoanCredit(brCode, loan.accountNo);
-              if (calculatedCredit !== 0) {
-                const reason = `Non-zero calculated credit on Loan ${loan.accountNo} (${calculatedCredit})`;
-                logger.warn(`Skipping Customer ${customer.custNo}: ${reason}`, { context: 'DropoutProcessService' });
-                
-                await this.customerRepo.logError({
-                  brCode,
-                  custNo: customer.custNo,
-                  failedStep: 'LOAN_VALIDATION',
-                  errorReason: reason,
-                  timestamp: new Date()
-                });
-
-                isValidForDropout = false;
-                break;
-              }
-              zeroOutBalance = true;
-            }
-
-            if (zeroOutBalance) {
-              command.anomaliesToLog.push({
-                custNo: customer.custNo,
-                accountType: 'LOAN',
-                accountNo: loan.accountNo,
-                lingeringBalance: loan.balance || loan.totalCredit,
-                timestamp: new Date()
-              });
-            }
-
-            command.accountsToClose.push({
-              type: 'LOAN',
-              accountNo: loan.accountNo,
-              zeroOutBalance
-            });
-          }
-
-          if (!isValidForDropout) continue;
-
-          // Step 6: Term Deposit Validation (Fail-fast)
-          for (const td of accountState.termDeposits) {
-            logger.debug(`Validating Term Deposit: ${td.accountNo}`, { context: 'DropoutProcessService' });
-
-            let zeroOutBalance = false;
-
-            if (td.balance !== 0) {
-              const calculatedBalance = await this.customerRepo.recalculateTermDepositBalance(brCode, td.accountNo);
-              if (calculatedBalance !== 0) {
-                const reason = `Non-zero calculated TD balance on account ${td.accountNo} (${calculatedBalance})`;
-                logger.warn(`Skipping Customer ${customer.custNo}: ${reason}`, { context: 'DropoutProcessService' });
-                
-                await this.customerRepo.logError({
-                  brCode,
-                  custNo: customer.custNo,
-                  failedStep: 'TD_VALIDATION',
-                  errorReason: reason,
-                  timestamp: new Date()
-                });
-
-                isValidForDropout = false;
-                break;
-              }
-              zeroOutBalance = true;
-            }
-
-            if (zeroOutBalance) {
-              command.anomaliesToLog.push({
-                custNo: customer.custNo,
-                accountType: 'TERM_DEPOSIT',
-                accountNo: td.accountNo,
-                lingeringBalance: td.balance,
-                timestamp: new Date()
-              });
-            }
-
-            command.accountsToClose.push({
-              type: 'TERM_DEPOSIT',
-              accountNo: td.accountNo,
-              zeroOutBalance
-            });
-          }
-
-          if (!isValidForDropout) continue;
-
-          // Step 7: Savings Validation (Fail-fast)
-          for (const savings of accountState.savings) {
-            logger.debug(`Validating Savings Account: ${savings.accountNo}`, { context: 'DropoutProcessService' });
-
-            let zeroOutBalance = false;
-
-            if (savings.balance !== 0) {
-              const calculatedBalance = await this.customerRepo.recalculateSavingsBalance(brCode, savings.accountNo);
-              if (calculatedBalance !== 0) {
-                const reason = `Non-zero calculated Savings balance on account ${savings.accountNo} (${calculatedBalance})`;
-                logger.warn(`Skipping Customer ${customer.custNo}: ${reason}`, { context: 'DropoutProcessService' });
-                
-                await this.customerRepo.logError({
-                  brCode,
-                  custNo: customer.custNo,
-                  failedStep: 'SAVINGS_VALIDATION',
-                  errorReason: reason,
-                  timestamp: new Date()
-                });
-
-                isValidForDropout = false;
-                break;
-              }
-              zeroOutBalance = true;
-            }
-
-            if (zeroOutBalance) {
-              command.anomaliesToLog.push({
-                custNo: customer.custNo,
-                accountType: 'SAVINGS',
-                accountNo: savings.accountNo,
-                lingeringBalance: savings.balance,
-                timestamp: new Date()
-              });
-            }
-
-            command.accountsToClose.push({
-              type: 'SAVINGS',
-              accountNo: savings.accountNo,
-              zeroOutBalance
-            });
-          }
-
-          if (!isValidForDropout) continue;
+          // Step 7: Savings Validation
+          const isSavingsValid = await this.validateSavings(accountState.savings, brCode, customer.custNo, command);
+          if (!isSavingsValid) continue;
 
           // Step 8: Execution
           await this.customerRepo.executeBatchDropoutTransaction(command);
@@ -271,5 +108,169 @@ export class DropoutProcessService {
       logger.error(`Critical failure in dropout process for branch ${brCode}`, { context: 'DropoutProcessService', error });
       return 0;
     }
+  }
+
+  private async validateLoans(loans: AccountState[], brCode: string, custNo: string, command: BatchDropoutCommand): Promise<boolean> {
+    for (const loan of loans) {
+      logger.debug(`Validating Loan Account: ${loan.accountNo}`, { context: 'DropoutProcessService' });
+
+      // Rule 5.1: Penal Paid must match Penal Provided
+      if (loan.penalPaidFcy !== loan.penalPrvdFcy) {
+        const reason = `Penal mismatch on Loan ${loan.accountNo} (Paid: ${loan.penalPaidFcy}, Prvd: ${loan.penalPrvdFcy})`;
+        logger.warn(`Skipping Customer ${custNo}: ${reason}`, { context: 'DropoutProcessService' });
+        
+        await this.customerRepo.logError({
+          brCode,
+          custNo: custNo,
+          failedStep: 'LOAN_VALIDATION',
+          errorReason: reason,
+          timestamp: new Date()
+        });
+        return false;
+      }
+
+      let zeroOutBalance = false;
+
+      // Rule 5.2: Balance Check & Recalculation
+      if (loan.balance !== 0) {
+        const calculatedBalance = await this.customerRepo.recalculateLoanBalance(brCode, loan.accountNo);
+        if (calculatedBalance !== 0) {
+          const reason = `Non-zero calculated balance on Loan ${loan.accountNo} (${calculatedBalance})`;
+          logger.warn(`Skipping Customer ${custNo}: ${reason}`, { context: 'DropoutProcessService' });
+          
+          await this.customerRepo.logError({
+            brCode,
+            custNo: custNo,
+            failedStep: 'LOAN_VALIDATION',
+            errorReason: reason,
+            timestamp: new Date()
+          });
+          return false;
+        }
+        zeroOutBalance = true;
+      }
+
+      // Rule 5.3: Total Credit Check & Recalculation
+      if (loan.totalCredit !== 0) {
+        const calculatedCredit = await this.customerRepo.recalculateLoanCredit(brCode, loan.accountNo);
+        if (calculatedCredit !== 0) {
+          const reason = `Non-zero calculated credit on Loan ${loan.accountNo} (${calculatedCredit})`;
+          logger.warn(`Skipping Customer ${custNo}: ${reason}`, { context: 'DropoutProcessService' });
+          
+          await this.customerRepo.logError({
+            brCode,
+            custNo: custNo,
+            failedStep: 'LOAN_VALIDATION',
+            errorReason: reason,
+            timestamp: new Date()
+          });
+          return false;
+        }
+        zeroOutBalance = true;
+      }
+
+      if (zeroOutBalance) {
+        command.anomaliesToLog.push({
+          custNo: custNo,
+          accountType: 'LOAN',
+          accountNo: loan.accountNo,
+          lingeringBalance: loan.balance || loan.totalCredit,
+          timestamp: new Date()
+        });
+      }
+
+      command.accountsToClose.push({
+        type: 'LOAN',
+        accountNo: loan.accountNo,
+        zeroOutBalance
+      });
+    }
+    return true;
+  }
+
+  private async validateTermDeposits(termDeposits: AccountState[], brCode: string, custNo: string, command: BatchDropoutCommand): Promise<boolean> {
+    for (const td of termDeposits) {
+      logger.debug(`Validating Term Deposit: ${td.accountNo}`, { context: 'DropoutProcessService' });
+
+      let zeroOutBalance = false;
+
+      if (td.balance !== 0) {
+        const calculatedBalance = await this.customerRepo.recalculateTermDepositBalance(brCode, td.accountNo);
+        if (calculatedBalance !== 0) {
+          const reason = `Non-zero calculated TD balance on account ${td.accountNo} (${calculatedBalance})`;
+          logger.warn(`Skipping Customer ${custNo}: ${reason}`, { context: 'DropoutProcessService' });
+          
+          await this.customerRepo.logError({
+            brCode,
+            custNo: custNo,
+            failedStep: 'TD_VALIDATION',
+            errorReason: reason,
+            timestamp: new Date()
+          });
+          return false;
+        }
+        zeroOutBalance = true;
+      }
+
+      if (zeroOutBalance) {
+        command.anomaliesToLog.push({
+          custNo: custNo,
+          accountType: 'TERM_DEPOSIT',
+          accountNo: td.accountNo,
+          lingeringBalance: td.balance,
+          timestamp: new Date()
+        });
+      }
+
+      command.accountsToClose.push({
+        type: 'TERM_DEPOSIT',
+        accountNo: td.accountNo,
+        zeroOutBalance
+      });
+    }
+    return true;
+  }
+
+  private async validateSavings(savings: AccountState[], brCode: string, custNo: string, command: BatchDropoutCommand): Promise<boolean> {
+    for (const savingsAcc of savings) {
+      logger.debug(`Validating Savings Account: ${savingsAcc.accountNo}`, { context: 'DropoutProcessService' });
+
+      let zeroOutBalance = false;
+
+      if (savingsAcc.balance !== 0) {
+        const calculatedBalance = await this.customerRepo.recalculateSavingsBalance(brCode, savingsAcc.accountNo);
+        if (calculatedBalance !== 0) {
+          const reason = `Non-zero calculated Savings balance on account ${savingsAcc.accountNo} (${calculatedBalance})`;
+          logger.warn(`Skipping Customer ${custNo}: ${reason}`, { context: 'DropoutProcessService' });
+          
+          await this.customerRepo.logError({
+            brCode,
+            custNo: custNo,
+            failedStep: 'SAVINGS_VALIDATION',
+            errorReason: reason,
+            timestamp: new Date()
+          });
+          return false;
+        }
+        zeroOutBalance = true;
+      }
+
+      if (zeroOutBalance) {
+        command.anomaliesToLog.push({
+          custNo: custNo,
+          accountType: 'SAVINGS',
+          accountNo: savingsAcc.accountNo,
+          lingeringBalance: savingsAcc.balance,
+          timestamp: new Date()
+        });
+      }
+
+      command.accountsToClose.push({
+        type: 'SAVINGS',
+        accountNo: savingsAcc.accountNo,
+        zeroOutBalance
+      });
+    }
+    return true;
   }
 }
